@@ -21,15 +21,7 @@
 ## 安装使用
 
 ### 快速安装
-```bash
-# 下载并运行脚本
-bash <(curl -fsSL https://raw.githubusercontent.com/your-repo/three-channel-routing/main/install.sh)
-
-# 或者下载脚本文件
-wget https://raw.githubusercontent.com/your-repo/three-channel-routing/main/install.sh
-chmod +x install.sh
-./install.sh
-```
+bash <(curl -fsSL https://raw.githubusercontent.com/vpn3288/warp/refs/heads/main/proxy.sh)
 
 ### 安装选项
 1. **安装 WARP Socks5 代理** - 仅安装 WARP 代理功能
@@ -274,18 +266,6 @@ systemctl restart warp-socks5
 3. **网络要求**: 需要能够访问 Cloudflare 服务
 4. **权限要求**: 需要 root 权限运行
 5. **端口要求**: 确保 40000 端口未被占用
-
-## 更新与维护
-
-### 脚本更新
-```bash
-# 重新下载最新版本
-wget -O install.sh https://raw.githubusercontent.com/your-repo/three-channel-routing/main/install.sh
-chmod +x install.sh
-
-# 保留现有配置更新
-./install.sh
-```
 
 ### 配置维护
 - 定期检查WARP连接状态
