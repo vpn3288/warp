@@ -453,55 +453,10 @@ configure_domain_rules() {
     echo
     
     # 预设的WARP代理域名
-    default_warp_domains=(
-        "openai.com"
-        "chatgpt.com" 
-        "claude.ai"
-        "anthropic.com"
-        "remove.bg"
-        "upscale.media"
-        "waifu2x.udp.jp"
-        "perplexity.ai"
-        "you.com"
-        "ip125.com"
-        "poe.com"
-        "character.ai"
-        "midjourney.com"
-        "stability.ai"
-        "huggingface.co"
-        "replicate.com"
-        "runpod.io"
-        "colab.research.google.com"
-        "bard.google.com"
-        "gemini.google.com"
-    )
+default_warp_domains=()
     
     # 预设的直连域名
-    default_direct_domains=(
-        "cn"
-        "com.cn"
-        "net.cn"
-        "org.cn"
-        "gov.cn"
-        "edu.cn"
-        "baidu.com"
-        "qq.com"
-        "taobao.com"
-        "tmall.com"
-        "jd.com"
-        "weibo.com"
-        "douyin.com"
-        "bilibili.com"
-        "zhihu.com"
-        "alipay.com"
-        "163.com"
-        "sina.com.cn"
-        "sohu.com"
-        "360.cn"
-        "tencent.com"
-        "alibaba.com"
-        "aliyun.com"
-    )
+    default_direct_domains=()
     
     green "通道1 - VPS直连域名配置："
     echo "默认包含: 国内网站、CDN域名"
@@ -524,11 +479,10 @@ configure_domain_rules() {
     warp_domains=("${default_warp_domains[@]}")
     
     if [[ $add_warp =~ [Yy] ]]; then
-        echo "请输入WARP代理域名，每行一个，输入空行结束："
-        while read -r line; do
-            [[ -z "$line" ]] && break
-            warp_domains+=("$line")
-        done
+        echo "请输入WARP代理域名，用空格分隔，回车确认："
+        read -r warp_input
+        IFS=' ' read -ra warp_array <<< "$warp_input"
+        warp_domains=("${warp_array[@]}")
     fi
     
     # 保存域名规则到配置文件
@@ -902,9 +856,6 @@ $(echo "$direct_domains_json" | jq -r '.[] | "  - DOMAIN-SUFFIX," + . + ",🎯 �
   - GEOSITE,CN,🎯 全球直连
   - GEOIP,CN,🎯 全球直连
   - GEOSITE,category-games@cn,🎯 全球直连
-  
-  # 国外网站走WARP
-  - GEOSITE,geolocation-!cn,🌍 WARP
   
   # 本地网络直连
   - IP-CIDR,192.168.0.0/16,🎯 全球直连,no-resolve
