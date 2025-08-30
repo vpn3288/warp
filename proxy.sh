@@ -415,49 +415,516 @@ EOF
     green "WireGuard配置已转换为Socks5格式"
 }
 
-# 全新安装WARP
-install_fresh_warp() {
-    log_info "全新安装WARP"
+# 多种WARP安装方案
+install_warp_multiple_methods() {
+    log_info "尝试多种WARP安装方案"
     
-    green "下载 warp-go..."
-    
-    # 使用新的下载验证函数
-    if ! download_and_verify_warp; then
-        red "warp-go 下载失败，尝试备用方案"
-        try_alternative_warp_install
-        return
-    fi
-    
-    # 生成WARP配置
-    generate_fresh_warp_config
-    
-    green "WARP安装完成"
-}
-
-# 备用WARP安装方案
-try_alternative_warp_install() {
-    log_info "尝试备用WARP安装方案"
-    
-    yellow "尝试使用系统包管理器安装wireguard-go..."
-    
-    if command -v apt &> /dev/null; then
-        apt update && apt install -y wireguard-go
-    elif command -v yum &> /dev/null; then
-        yum install -y wireguard-tools
-    elif command -v dnf &> /dev/null; then
-        dnf install -y wireguard-tools
-    fi
-    
-    # 检查是否安装成功
-    if command -v wireguard-go &> /dev/null; then
-        WARP_BINARY=$(which wireguard-go)
-        green "使用 wireguard-go 作为备用方案"
-        USE_WIREGUARD_GO=true
+    # 方案1: 官方WARP客户端
+    if try_official_warp_client; then
         return 0
     fi
     
-    red "备用方案也失败，请手动安装warp-go"
+    # 方案2: 静态编译的warp-go
+    if try_static_warp_go; then
+        return 0
+    fi
+    
+    # 方案3: 使用现有wireguard + socat代理
+    if try_wireguard_socat_proxy; then
+        return 0
+    fi
+    
+    # 方案4: 使用redsocks透明代理
+    if try_redsocks_transparent_proxy; then
+        return 0
+    fi
+    
+    red "所有WARP安装方案都失败"
     return 1
+}
+
+# 方案1: 官方WARP客户端
+try_official_warp_client() {
+    yellow "尝试安装官方WARP客户端..."
+    
+    # 添加Cloudflare仓库
+    if command -v apt &> /dev/null; then
+        curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+        echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | tee /etc/apt/sources.list.d/cloudflare-client.list
+        apt update && apt install -y cloudflare-warp
+    elif command -v yum &> /dev/null; then
+        curl -fsSl https://pkg.cloudflareclient.com/cloudflare-warp-ascii.repo | tee /etc/yum.repos.d/cloudflare-warp.repo
+        yum install -y cloudflare-warp
+    else
+        return 1
+    fi
+    
+    # 配置WARP客户端
+    if command -v warp-cli &> /dev/null; then
+        # 注册并设置为代理模式
+        warp-cli register
+        warp-cli set-mode proxy
+        warp-cli set-proxy-port 40000
+        warp-cli connect
+        
+        sleep 5
+        
+        # 测试连接
+        if test_warp_connection; then
+            green "官方WARP客户端安装成功"
+            WARP_METHOD="official_client"
+            return 0
+        fi
+    fi
+    
+    return 1
+}
+
+# 方案2: 静态编译的warp-go
+try_static_warp_go() {
+    yellow "尝试静态编译的warp-go..."
+    
+    # 使用不同的静态编译版本
+    local static_urls=(
+        "https://github.com/bepass-org/warp-plus/releases/latest/download/warp-plus-linux-${WARP_ARCH}"
+        "https://github.com/ALIILAPRO/warp-plus-cloudflare/releases/latest/download/warp-plus-linux-${WARP_ARCH}"
+    )
+    
+    for url in "${static_urls[@]}"; do
+        yellow "尝试下载: $url"
+        
+        if curl -sL --connect-timeout 15 --max-time 60 "$url" -o /tmp/warp-static; then
+            chmod +x /tmp/warp-static
+            
+            # 测试运行
+            if /tmp/warp-static --version >/dev/null 2>&1; then
+                mv /tmp/warp-static /usr/local/bin/warp-go
+                WARP_BINARY="/usr/local/bin/warp-go"
+                green "静态warp-go安装成功"
+                generate_fresh_warp_config
+                return 0
+            fi
+        fi
+        rm -f /tmp/warp-static
+    done
+    
+    return 1
+}
+
+# 方案3: WireGuard + socat代理
+try_wireguard_socat_proxy() {
+    yellow "尝试WireGuard + socat代理方案..."
+    
+    # 安装依赖
+    if command -v apt &> /dev/null; then
+        apt install -y wireguard-tools socat
+    elif command -v yum &> /dev/null; then
+        yum install -y wireguard-tools socat
+    elif command -v dnf &> /dev/null; then
+        dnf install -y wireguard-tools socat
+    else
+        return 1
+    fi
+    
+    # 检查安装
+    if ! command -v wg &> /dev/null || ! command -v socat &> /dev/null; then
+        return 1
+    fi
+    
+    # 生成WireGuard配置
+    generate_wireguard_config
+    
+    # 创建socat代理服务
+    create_socat_proxy_service
+    
+    WARP_METHOD="wireguard_socat"
+    green "WireGuard + socat代理安装成功"
+    return 0
+}
+
+# 生成WireGuard配置
+generate_wireguard_config() {
+    local private_key=$(wg genkey)
+    local public_key=$(echo "$private_key" | wg pubkey)
+    
+    local endpoints=(
+        "162.159.193.10:2408"
+        "162.159.192.1:2408"
+        "188.114.97.1:2408"
+        "188.114.96.1:2408"
+    )
+    local endpoint=${endpoints[$RANDOM % ${#endpoints[@]}]}
+    
+    cat > /etc/wireguard/wg0.conf <<EOF
+[Interface]
+PrivateKey = $private_key
+Address = 172.16.0.2/32
+Address = 2606:4700:110:$(openssl rand -hex 2):$(openssl rand -hex 2):$(openssl rand -hex 2):$(openssl rand -hex 2):$(openssl rand -hex 2)/128
+DNS = 1.1.1.1
+MTU = 1280
+
+[Peer]
+PublicKey = bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=
+AllowedIPs = 0.0.0.0/0, ::/0
+Endpoint = $endpoint
+PersistentKeepalive = 25
+EOF
+    
+    green "WireGuard配置已生成"
+}
+
+# 创建socat代理服务
+create_socat_proxy_service() {
+    cat > /etc/systemd/system/warp-socks5.service <<EOF
+[Unit]
+Description=WARP WireGuard + Socat Proxy
+After=network-online.target
+Wants=network-online.target
+Requires=wg-quick@wg0.service
+After=wg-quick@wg0.service
+
+[Service]
+Type=forking
+ExecStartPre=/usr/bin/systemctl start wg-quick@wg0
+ExecStart=/usr/bin/socat TCP4-LISTEN:40000,reuseaddr,fork SOCKS4A:172.16.0.1:0,socksport=1080
+ExecStop=/usr/bin/systemctl stop wg-quick@wg0
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable wg-quick@wg0
+    systemctl enable warp-socks5
+    
+    green "socat代理服务已创建"
+}
+
+# 方案4: redsocks透明代理
+try_redsocks_transparent_proxy() {
+    yellow "尝试redsocks透明代理方案..."
+    
+    # 安装redsocks
+    if command -v apt &> /dev/null; then
+        apt install -y redsocks iptables-persistent
+    elif command -v yum &> /dev/null; then
+        yum install -y redsocks iptables
+    else
+        return 1
+    fi
+    
+    if ! command -v redsocks &> /dev/null; then
+        return 1
+    fi
+    
+    # 先建立WireGuard连接
+    generate_wireguard_config
+    systemctl enable wg-quick@wg0
+    systemctl start wg-quick@wg0
+    sleep 3
+    
+    # 配置redsocks
+    cat > /etc/redsocks.conf <<EOF
+base {
+    log_debug = off;
+    log_info = on;
+    log = "syslog:daemon";
+    daemon = on;
+    redirector = iptables;
+}
+
+redsocks {
+    local_ip = 127.0.0.1;
+    local_port = 40000;
+    ip = 172.16.0.1;
+    port = 1080;
+    type = socks5;
+}
+EOF
+    
+    # 创建redsocks服务
+    systemctl enable redsocks
+    systemctl start redsocks
+    
+    WARP_METHOD="redsocks_transparent"
+    green "redsocks透明代理安装成功"
+    return 0
+}
+
+# 全新安装WARP - 使用多种可靠方案
+install_fresh_warp() {
+    log_info "全新安装WARP - 尝试多种方案"
+    
+    clear
+    blue "=== 选择WARP安装方案 ==="
+    echo "1. 官方WARP客户端 (推荐)"
+    echo "2. 静态编译warp-go"
+    echo "3. WireGuard + socat代理"
+    echo "4. 自动选择最佳方案"
+    echo
+    readp "请选择安装方案 [1-4]: " method_choice
+    
+    case $method_choice in
+        1) 
+            if try_official_warp_client; then
+                green "官方WARP客户端安装成功"
+            else
+                yellow "官方客户端安装失败，尝试其他方案"
+                install_warp_multiple_methods
+            fi
+            ;;
+        2)
+            if try_static_warp_go; then
+                green "静态warp-go安装成功"
+            else
+                yellow "静态warp-go安装失败，尝试其他方案"
+                install_warp_multiple_methods
+            fi
+            ;;
+        3)
+            if try_wireguard_socat_proxy; then
+                green "WireGuard代理安装成功"
+            else
+                yellow "WireGuard代理安装失败"
+                return 1
+            fi
+            ;;
+        4)
+            install_warp_multiple_methods
+            ;;
+        *)
+            red "无效选择，使用自动方案"
+            install_warp_multiple_methods
+            ;;
+    esac
+}
+
+# 增强的应用fscarmen sing-box配置 - 完全兼容新版本
+apply_fscarmen_singbox_config() {
+    log_info "应用fscarmen sing-box配置 (新版兼容)"
+    
+    local conf_dir="/etc/sing-box/conf"
+    local outbounds_file="$conf_dir/01_outbounds.json"
+    local route_file="$conf_dir/03_route.json"
+    
+    if [[ ! -d "$conf_dir" ]]; then
+        red "fscarmen sing-box配置目录不存在"
+        return 1
+    fi
+    
+    # 检查sing-box版本
+    local singbox_version=""
+    if command -v sing-box &> /dev/null; then
+        singbox_version=$(sing-box version 2>/dev/null | grep -oP 'sing-box version \K[0-9.]+' | head -1)
+        log_info "检测到sing-box版本: $singbox_version"
+    fi
+    
+    # 备份配置文件
+    [[ -f $outbounds_file ]] && cp $outbounds_file "${outbounds_file}.backup"
+    [[ -f $route_file ]] && cp $route_file "${route_file}.backup"
+    
+    # 1. 添加WARP Socks5出站
+    add_warp_outbound_to_fscarmen "$outbounds_file"
+    
+    # 2. 修改路由规则 - 根据版本使用不同策略
+    if [[ -n "$singbox_version" ]] && version_compare "$singbox_version" "1.8.0"; then
+        create_modern_fscarmen_route_config "$route_file"
+    else
+        create_legacy_fscarmen_route_config "$route_file"
+    fi
+    
+    # 验证配置并重启
+    if validate_and_restart_singbox; then
+        green "fscarmen sing-box配置应用成功"
+    else
+        red "配置应用失败，恢复备份"
+        restore_singbox_backups
+        return 1
+    fi
+}
+
+# 添加WARP出站到fscarmen配置
+add_warp_outbound_to_fscarmen() {
+    local outbounds_file="$1"
+    
+    if [[ -f $outbounds_file ]]; then
+        if ! jq empty "$outbounds_file" 2>/dev/null; then
+            red "出站配置文件JSON格式错误"
+            return 1
+        fi
+        
+        local outbounds=$(cat $outbounds_file)
+        
+        # 检查是否已存在warp-socks5出站
+        if ! echo "$outbounds" | jq -e '.outbounds[]? | select(.tag == "warp-socks5")' > /dev/null 2>&1; then
+            local new_outbound='{
+                "type": "socks",
+                "tag": "warp-socks5", 
+                "server": "127.0.0.1",
+                "server_port": 40000,
+                "version": "5"
+            }'
+            
+            local updated_outbounds
+            if echo "$outbounds" | jq -e '.outbounds' > /dev/null 2>&1; then
+                updated_outbounds=$(echo "$outbounds" | jq --argjson newout "$new_outbound" '.outbounds += [$newout]')
+            else
+                updated_outbounds='{"outbounds": ['"$new_outbound"']}'
+            fi
+            
+            echo "$updated_outbounds" > $outbounds_file
+            green "已添加WARP Socks5出站配置"
+        else
+            green "WARP Socks5出站配置已存在"
+        fi
+    else
+        # 创建新的出站配置
+        cat > $outbounds_file <<EOF
+{
+    "outbounds": [
+        {
+            "type": "socks",
+            "tag": "warp-socks5",
+            "server": "127.0.0.1",
+            "server_port": 40000,
+            "version": "5"
+        }
+    ]
+}
+EOF
+        green "已创建WARP Socks5出站配置"
+    fi
+}
+
+# 现代fscarmen路由配置 (无geosite)
+create_modern_fscarmen_route_config() {
+    local route_file="$1"
+    local warp_domains=$(cat $CONFIG_DIR/warp-domains.json)
+    
+    cat > "$route_file" <<EOF
+{
+    "route": {
+        "auto_detect_interface": true,
+        "final": "direct",
+        "rules": [
+            {
+                "protocol": "dns",
+                "outbound": "dns-out"
+            },
+            {
+                "port": 53,
+                "outbound": "dns-out"
+            },
+            {
+                "protocol": ["quic"],
+                "outbound": "block"
+            },
+            {
+                "domain_suffix": $warp_domains,
+                "outbound": "warp-socks5"
+            },
+            {
+                "domain_keyword": ["openai", "anthropic", "claude", "chatgpt", "bard", "perplexity", "github", "telegram", "discord", "twitter", "facebook", "youtube", "instagram", "reddit", "netflix", "spotify"],
+                "outbound": "warp-socks5"
+            },
+            {
+                "domain_suffix": [".cn", ".中国", ".中國", ".gov.cn", ".edu.cn"],
+                "outbound": "direct"
+            },
+            {
+                "domain_keyword": ["baidu", "qq", "taobao", "tmall", "alipay", "wechat", "weixin", "douban", "zhihu", "bilibili"],
+                "outbound": "direct"
+            },
+            {
+                "ip_cidr": [
+                    "10.0.0.0/8", 
+                    "172.16.0.0/12", 
+                    "192.168.0.0/16", 
+                    "127.0.0.0/8",
+                    "169.254.0.0/16"
+                ],
+                "outbound": "direct"
+            }
+        ]
+    }
+}
+EOF
+    green "已创建现代fscarmen路由配置 (sing-box 1.8.0+兼容)"
+}
+
+# 传统fscarmen路由配置 (保留geosite)
+create_legacy_fscarmen_route_config() {
+    local route_file="$1"
+    local warp_domains=$(cat $CONFIG_DIR/warp-domains.json)
+    
+    cat > "$route_file" <<EOF
+{
+    "route": {
+        "auto_detect_interface": true,
+        "final": "direct",
+        "rules": [
+            {
+                "protocol": "dns",
+                "outbound": "dns-out"
+            },
+            {
+                "port": 53,
+                "outbound": "dns-out"
+            },
+            {
+                "protocol": ["quic"],
+                "outbound": "block"
+            },
+            {
+                "domain_suffix": $warp_domains,
+                "outbound": "warp-socks5"
+            },
+            {
+                "geosite": ["openai", "anthropic", "google", "github", "telegram", "discord"],
+                "outbound": "warp-socks5"
+            },
+            {
+                "geosite": ["cn", "apple-cn", "google-cn", "category-games@cn"],
+                "outbound": "direct"
+            },
+            {
+                "geoip": ["cn", "private"],
+                "outbound": "direct"
+            }
+        ]
+    }
+}
+EOF
+    green "已创建传统fscarmen路由配置"
+}
+
+# 验证并重启sing-box
+validate_and_restart_singbox() {
+    log_info "验证并重启sing-box"
+    
+    # 验证配置
+    if command -v sing-box &> /dev/null; then
+        if ! sing-box check -c /etc/sing-box 2>/dev/null; then
+            red "sing-box配置验证失败"
+            return 1
+        fi
+        green "sing-box配置验证通过"
+    fi
+    
+    # 重启服务
+    systemctl restart sing-box
+    sleep 3
+    
+    if systemctl is-active --quiet sing-box; then
+        green "sing-box服务重启成功"
+        return 0
+    else
+        red "sing-box服务重启失败"
+        yellow "查看错误: journalctl -u sing-box -n 20"
+        return 1
+    fi
 }
 
 # 生成全新WARP配置
@@ -2706,6 +3173,132 @@ show_help() {
     echo
     readp "按回车返回菜单..."
 }
+
+# 安装和配置WARP - 主函数更新
+install_configure_warp() {
+    clear
+    green "=== 安装/配置 WARP Socks5 代理 ==="
+    echo
+    
+    detect_system
+    install_dependencies
+    
+    # 检测现有WARP
+    if detect_existing_warp; then
+        yellow "检测到现有WARP安装: $EXISTING_WARP_TYPE"
+        readp "是否使用现有安装？[Y/n]: " use_existing
+        
+        if [[ ! $use_existing =~ [Nn] ]]; then
+            if configure_existing_warp; then
+                green "现有WARP配置成功"
+                return 0
+            else
+                yellow "现有WARP配置失败，尝试全新安装"
+            fi
+        fi
+    fi
+    
+    # 全新安装WARP
+    if install_fresh_warp; then
+        green "WARP安装配置完成"
+    else
+        red "WARP安装失败"
+        exit 1
+    fi
+}
+
+# 重启sing-box服务 - 增强版本
+restart_singbox_service() {
+    log_info "重启sing-box服务"
+    
+    # 首先验证配置文件
+    if ! validate_and_restart_singbox; then
+        return 1
+    fi
+    
+    return 0
+}
+
+# 完整的清理函数
+cleanup() {
+    # 清理临时文件
+    rm -f /tmp/warp-test.json /tmp/singbox-merged.json /tmp/warp-static /tmp/warp-go
+    log_info "脚本退出，清理完成"
+}
+
+# 主函数入口 - 完整版
+main() {
+    # 初始化检查
+    check_system_compatibility
+    
+    # 创建必要目录
+    mkdir -p $CONFIG_DIR
+    mkdir -p "$(dirname $LOG_FILE)"
+    
+    # 记录脚本启动
+    log_info "三通道域名分流脚本启动 v${VERSION}"
+    
+    # 处理命令行参数
+    case "${1:-}" in
+        "install"|"-i") install_configure_warp;;
+        "config"|"-c") auto_detect_and_configure;;
+        "test"|"-t") show_status_and_test;;
+        "uninstall"|"-u") uninstall_all;;
+        "update"|"--update") update_script;;
+        "diagnose"|"-d") diagnose_routing_issues;;
+        "help"|"-h"|"--help") 
+            show_help
+            ;;
+        "menu"|"-m"|"") 
+            # 默认进入交互菜单
+            while true; do
+                main_menu
+            done
+            ;;
+        *)
+            red "未知参数: $1"
+            echo "使用方法:"
+            echo "  $0                    # 进入交互菜单"
+            echo "  $0 install           # 安装WARP"
+            echo "  $0 config            # 配置分流"
+            echo "  $0 test              # 测试状态"
+            echo "  $0 diagnose          # 诊断问题"
+            echo "  $0 help              # 显示帮助"
+            exit 1
+            ;;
+    esac
+}
+
+# 检查系统兼容性 - 完整版
+check_system_compatibility() {
+    # 检查root权限
+    if [[ $EUID -ne 0 ]]; then
+        red "请使用root权限运行此脚本"
+        exit 1
+    fi
+    
+    # 检查系统类型
+    if [[ ! -f /etc/os-release ]]; then
+        red "不支持的系统类型"
+        exit 1
+    fi
+    
+    # 检查systemd
+    if ! command -v systemctl &> /dev/null; then
+        red "系统不支持systemd"
+        exit 1
+    fi
+    
+    # 检查基本网络工具
+    if ! command -v curl &> /dev/null && ! command -v wget &> /dev/null; then
+        red "curl和wget都未安装，请先安装网络工具"
+        exit 1
+    fi
+}
+
+# 信号处理
+trap cleanup EXIT
+trap 'red "脚本被中断"; cleanup; exit 1' INT TERM
 
 # 启动脚本
 main "$@"
