@@ -22,11 +22,12 @@ readp(){ read -p "$(yellow "$1")" $2;}
 CONFIG_DIR="/etc/three-channel-routing"
 LOG_FILE="/var/log/three-channel-routing.log"
 
-# 全局变量
+# 全局变量 - 添加备用标志
 WARP_BINARY=""
 WARP_CONFIG=""
 EXISTING_WARP_TYPE=""
 PANEL_TYPE=""
+USE_WIREGUARD_GO=""
 
 # 预设域名列表 - 需要走WARP的域名
 DEFAULT_WARP_DOMAINS=(
@@ -127,16 +128,20 @@ detect_system() {
         exit 1
     fi
     
-    # 检查架构
+    # 检查架构 - 修复架构检测
     ARCH=$(uname -m)
     case $ARCH in
         "x86_64") WARP_ARCH="amd64";;
-        "aarch64") WARP_ARCH="arm64";;
-        "armv7l") WARP_ARCH="armv7";;
+        "aarch64"|"arm64") WARP_ARCH="arm64";;
+        "armv7l"|"armv7") WARP_ARCH="armv7";;
+        "i386"|"i686") WARP_ARCH="386";;
         *) red "不支持的架构: $ARCH" && exit 1;;
     esac
     
-    green "系统: $OS $VER ($ARCH)"
+    green "系统: $OS $VER ($ARCH -> $WARP_ARCH)"
+    
+    # 验证架构兼容性
+    validate_architecture
 }
 
 # 安装依赖
@@ -416,23 +421,43 @@ install_fresh_warp() {
     
     green "下载 warp-go..."
     
-    # 下载warp-go
-    local warp_url="https://gitlab.com/ProjectWARP/warp-go/-/releases/permalink/latest/downloads/warp-go_linux_${WARP_ARCH}"
-    
-    mkdir -p /usr/local/bin
-    if curl -sL "$warp_url" -o /usr/local/bin/warp-go; then
-        chmod +x /usr/local/bin/warp-go
-        WARP_BINARY="/usr/local/bin/warp-go"
-        green "warp-go 下载成功"
-    else
-        red "warp-go 下载失败"
-        exit 1
+    # 使用新的下载验证函数
+    if ! download_and_verify_warp; then
+        red "warp-go 下载失败，尝试备用方案"
+        try_alternative_warp_install
+        return
     fi
     
     # 生成WARP配置
     generate_fresh_warp_config
     
     green "WARP安装完成"
+}
+
+# 备用WARP安装方案
+try_alternative_warp_install() {
+    log_info "尝试备用WARP安装方案"
+    
+    yellow "尝试使用系统包管理器安装wireguard-go..."
+    
+    if command -v apt &> /dev/null; then
+        apt update && apt install -y wireguard-go
+    elif command -v yum &> /dev/null; then
+        yum install -y wireguard-tools
+    elif command -v dnf &> /dev/null; then
+        dnf install -y wireguard-tools
+    fi
+    
+    # 检查是否安装成功
+    if command -v wireguard-go &> /dev/null; then
+        WARP_BINARY=$(which wireguard-go)
+        green "使用 wireguard-go 作为备用方案"
+        USE_WIREGUARD_GO=true
+        return 0
+    fi
+    
+    red "备用方案也失败，请手动安装warp-go"
+    return 1
 }
 
 # 生成全新WARP配置
@@ -476,7 +501,7 @@ EOF
     green "WARP配置生成完成"
 }
 
-# 创建WARP Socks5服务
+# 创建WARP Socks5服务 - 增强版本检测和兼容性
 create_warp_socks5_service() {
     log_info "创建WARP Socks5服务"
     
@@ -488,22 +513,57 @@ create_warp_socks5_service() {
         fi
     fi
     
+    # 验证二进制文件是否可执行
+    if [[ ! -x "$WARP_BINARY" ]]; then
+        red "WARP二进制文件不可执行: $WARP_BINARY"
+        return 1
+    fi
+    
+    # 测试二进制文件
+    if ! "$WARP_BINARY" --version >/dev/null 2>&1; then
+        red "WARP二进制文件测试失败，可能存在架构不匹配问题"
+        
+        # 显示文件信息用于调试
+        yellow "文件信息:"
+        file "$WARP_BINARY" || true
+        yellow "系统架构: $(uname -m)"
+        
+        # 尝试使用备用方案
+        if [[ "$USE_WIREGUARD_GO" == "true" ]]; then
+            create_wireguard_service
+            return
+        else
+            return 1
+        fi
+    fi
+    
+    # 创建服务配置
+    local exec_start_cmd
+    if [[ "$USE_WIREGUARD_GO" == "true" ]]; then
+        exec_start_cmd="$WARP_BINARY wg0"
+    else
+        exec_start_cmd="$WARP_BINARY --config $WARP_CONFIG"
+    fi
+    
     cat > /etc/systemd/system/warp-socks5.service <<EOF
 [Unit]
 Description=WARP Socks5 Proxy for Three-Channel Routing
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
 
 [Service]
 Type=simple
 User=root
-ExecStart=$WARP_BINARY --config $WARP_CONFIG
-ExecStartPre=/bin/sleep 2
-Restart=always
-RestartSec=5
+ExecStart=$exec_start_cmd
+ExecStartPre=/bin/sleep 3
+Restart=on-failure
+RestartSec=10
 LimitNOFILE=1048576
 KillMode=mixed
-TimeoutStopSec=10
+TimeoutStopSec=15
+TimeoutStartSec=30
 StandardOutput=journal
 StandardError=journal
 
@@ -512,6 +572,352 @@ WantedBy=multi-user.target
 EOF
 
     systemctl daemon-reload
+    systemctl enable warp-socks5
+    green "WARP Socks5服务已创建"
+}
+
+# 启动WARP服务 - 增强错误处理和诊断
+start_warp_service() {
+    log_info "启动WARP服务"
+    
+    # 停止可能冲突的服务
+    systemctl stop warp-go 2>/dev/null
+    systemctl stop wg-quick@warp 2>/dev/null
+    systemctl stop wg-quick@wg0 2>/dev/null
+    
+    # 检查端口占用
+    if check_port_usage 40000; then
+        yellow "端口40000可用"
+    else
+        yellow "端口40000被占用，尝试终止占用进程..."
+        local pid=$(lsof -ti:40000 2>/dev/null)
+        if [[ -n "$pid" ]]; then
+            kill -9 $pid 2>/dev/null
+            sleep 2
+        fi
+    fi
+    
+    # 启动服务
+    systemctl restart warp-socks5
+    sleep 8
+    
+    # 检查服务状态
+    if systemctl is-active --quiet warp-socks5; then
+        green "WARP Socks5 服务启动成功 (127.0.0.1:40000)"
+        
+        # 验证端口监听
+        local retry_count=0
+        while [[ $retry_count -lt 10 ]]; do
+            if netstat -tlnp 2>/dev/null | grep -q "127.0.0.1:40000"; then
+                green "Socks5端口监听确认"
+                break
+            fi
+            sleep 1
+            ((retry_count++))
+        done
+        
+        # 测试连接
+        if test_warp_connection; then
+            green "WARP连接测试成功"
+            return 0
+        else
+            yellow "WARP连接测试失败，进行故障诊断..."
+            diagnose_warp_connection_failure
+        fi
+    else
+        red "WARP服务启动失败"
+        log_error "WARP服务启动失败"
+        show_warp_service_logs
+        return 1
+    fi
+}
+
+# WARP连接故障诊断
+diagnose_warp_connection_failure() {
+    yellow "=== WARP连接故障诊断 ==="
+    
+    # 1. 检查服务状态
+    echo "1. 服务状态检查:"
+    systemctl status warp-socks5 --no-pager -l
+    
+    # 2. 检查端口监听
+    echo "2. 端口监听检查:"
+    netstat -tlnp | grep ":40000" || echo "端口40000未监听"
+    
+    # 3. 检查配置文件
+    echo "3. 配置文件检查:"
+    if [[ -f $WARP_CONFIG ]]; then
+        echo "配置文件存在: $WARP_CONFIG"
+        echo "配置文件大小: $(stat -c%s $WARP_CONFIG) 字节"
+    else
+        echo "配置文件不存在: $WARP_CONFIG"
+    fi
+    
+    # 4. 检查二进制文件
+    echo "4. 二进制文件检查:"
+    if [[ -f $WARP_BINARY ]]; then
+        echo "二进制文件: $WARP_BINARY"
+        echo "文件权限: $(ls -la $WARP_BINARY)"
+        file $WARP_BINARY
+        
+        # 测试执行
+        if $WARP_BINARY --version >/dev/null 2>&1; then
+            echo "二进制文件可正常执行"
+        else
+            echo "二进制文件执行失败 - 可能架构不匹配"
+            echo "系统架构: $(uname -m)"
+            echo "二进制架构: $(file $WARP_BINARY | grep -o 'ELF [^,]*')"
+        fi
+    else
+        echo "二进制文件不存在: $WARP_BINARY"
+    fi
+    
+    # 5. 网络连接测试
+    echo "5. 网络连接测试:"
+    if curl -s --max-time 5 https://1.1.1.1 > /dev/null; then
+        echo "网络连接正常"
+    else
+        echo "网络连接异常"
+    fi
+    
+    # 6. 防火墙检查
+    echo "6. 防火墙检查:"
+    if command -v iptables &> /dev/null; then
+        iptables -L | grep -i drop || echo "无阻断规则"
+    fi
+    
+    # 提供解决建议
+    echo
+    yellow "=== 解决建议 ==="
+    echo "1. 如果二进制文件架构不匹配，请重新下载正确架构版本"
+    echo "2. 如果网络连接异常，请检查VPS网络设置"
+    echo "3. 如果服务持续失败，请查看详细日志: journalctl -u warp-socks5 -f"
+    echo "4. 可尝试使用备用安装方案或手动配置"
+}
+
+# 显示WARP服务日志
+show_warp_service_logs() {
+    yellow "最近的WARP服务日志:"
+    journalctl -u warp-socks5 -n 10 --no-pager
+}
+
+# 增强的WARP连接测试
+test_warp_connection() {
+    local max_retries=3
+    local retry_count=0
+    
+    while [[ $retry_count -lt $max_retries ]]; do
+        local test_result=$(curl -s --socks5 127.0.0.1:40000 --max-time 15 http://ip-api.com/json 2>/dev/null)
+        
+        if [[ -n "$test_result" ]]; then
+            local warp_ip=$(echo "$test_result" | jq -r '.query // "unknown"' 2>/dev/null)
+            local warp_country=$(echo "$test_result" | jq -r '.country // "unknown"' 2>/dev/null)
+            
+            if [[ "$warp_ip" != "unknown" && "$warp_ip" != "null" && "$warp_ip" != "" ]]; then
+                blue "WARP IP: $warp_ip ($warp_country)"
+                return 0
+            fi
+        fi
+        
+        ((retry_count++))
+        if [[ $retry_count -lt $max_retries ]]; then
+            yellow "连接测试失败，${retry_count}/${max_retries}，重试中..."
+            sleep 3
+        fi
+    done
+    
+    return 1
+}
+
+# 应用fscarmen sing-box配置 - 增强错误处理
+apply_fscarmen_singbox_config() {
+    log_info "应用fscarmen sing-box配置"
+    
+    local conf_dir="/etc/sing-box/conf"
+    local outbounds_file="$conf_dir/01_outbounds.json"
+    local route_file="$conf_dir/03_route.json"
+    
+    if [[ ! -d "$conf_dir" ]]; then
+        red "fscarmen sing-box配置目录不存在"
+        return 1
+    fi
+    
+    # 备份配置文件
+    [[ -f $outbounds_file ]] && cp $outbounds_file "${outbounds_file}.backup"
+    [[ -f $route_file ]] && cp $route_file "${route_file}.backup"
+    
+    # 1. 添加WARP Socks5出站到 01_outbounds.json
+    if [[ -f $outbounds_file ]]; then
+        if ! jq empty "$outbounds_file" 2>/dev/null; then
+            red "出站配置文件JSON格式错误"
+            return 1
+        fi
+        
+        local outbounds=$(cat $outbounds_file)
+        
+        # 检查是否已存在warp-socks5出站
+        if ! echo "$outbounds" | jq -e '.outbounds[]? | select(.tag == "warp-socks5")' > /dev/null 2>&1; then
+            # 添加warp-socks5出站
+            local new_outbound='{
+                "type": "socks",
+                "tag": "warp-socks5", 
+                "server": "127.0.0.1",
+                "server_port": 40000,
+                "version": "5"
+            }'
+            
+            local updated_outbounds
+            if echo "$outbounds" | jq -e '.outbounds' > /dev/null 2>&1; then
+                updated_outbounds=$(echo "$outbounds" | jq --argjson newout "$new_outbound" '.outbounds += [$newout]')
+            else
+                updated_outbounds='{"outbounds": ['"$new_outbound"']}'
+            fi
+            
+            echo "$updated_outbounds" > $outbounds_file
+            green "已添加WARP Socks5出站配置"
+        else
+            green "WARP Socks5出站配置已存在"
+        fi
+    else
+        # 创建新的出站配置文件
+        cat > $outbounds_file <<EOF
+{
+    "outbounds": [
+        {
+            "type": "socks",
+            "tag": "warp-socks5",
+            "server": "127.0.0.1",
+            "server_port": 40000,
+            "version": "5"
+        }
+    ]
+}
+EOF
+        green "已创建WARP Socks5出站配置"
+    fi
+    
+    # 2. 修改路由规则 03_route.json
+    if [[ -f $route_file ]]; then
+        if ! jq empty "$route_file" 2>/dev/null; then
+            red "路由配置文件JSON格式错误"
+            return 1
+        fi
+        
+        local routes=$(cat $route_file)
+        local warp_domains=$(cat $CONFIG_DIR/warp-domains.json)
+        
+        # 根据sing-box版本创建规则
+        local singbox_version=""
+        if command -v sing-box &> /dev/null; then
+            singbox_version=$(sing-box version 2>/dev/null | grep -oP 'sing-box version \K[0-9.]+' | head -1)
+        fi
+        
+        if [[ -n "$singbox_version" ]] && version_compare "$singbox_version" "1.8.0"; then
+            # 新版本配置
+            local warp_rule='{
+                "domain_suffix": '"$warp_domains"',
+                "outbound": "warp-socks5"
+            }'
+            
+            local warp_keyword_rule='{
+                "domain_keyword": ["openai", "anthropic", "claude", "chatgpt", "bard", "perplexity"],
+                "outbound": "warp-socks5"
+            }'
+            
+            local updated_routes=$(echo "$routes" | jq --argjson warprule "$warp_rule" --argjson warpkeyword "$warp_keyword_rule" '
+                if .route and .route.rules then
+                    .route.rules = [$warprule, $warpkeyword] + (.route.rules | map(select(.outbound != "warp-socks5")))
+                elif .rules then  
+                    .rules = [$warprule, $warpkeyword] + (.rules | map(select(.outbound != "warp-socks5")))
+                else
+                    .route.rules = [$warprule, $warpkeyword]
+                end
+            ')
+        else
+            # 旧版本配置（如果geosite仍然支持）
+            local warp_rule='{
+                "domain_suffix": '"$warp_domains"',
+                "outbound": "warp-socks5"
+            }'
+            
+            local updated_routes=$(echo "$routes" | jq --argjson warprule "$warp_rule" '
+                if .route and .route.rules then
+                    .route.rules = [$warprule] + (.route.rules | map(select(.outbound != "warp-socks5")))
+                elif .rules then  
+                    .rules = [$warprule] + (.rules | map(select(.outbound != "warp-socks5")))
+                else
+                    .route.rules = [$warprule]
+                end
+            ')
+        fi
+        
+        echo "$updated_routes" > $route_file
+        green "已更新路由规则"
+    else
+        yellow "路由配置文件不存在，创建新文件"
+        create_fscarmen_route_config
+    fi
+    
+    # 验证配置并重启服务
+    if restart_singbox_service; then
+        green "fscarmen sing-box配置应用成功"
+    else
+        red "配置应用失败，正在恢复备份..."
+        restore_singbox_backups
+    fi
+}
+
+# 恢复sing-box备份
+restore_singbox_backups() {
+    [[ -f /etc/sing-box/conf/01_outbounds.json.backup ]] && mv /etc/sing-box/conf/01_outbounds.json.backup /etc/sing-box/conf/01_outbounds.json
+    [[ -f /etc/sing-box/conf/03_route.json.backup ]] && mv /etc/sing-box/conf/03_route.json.backup /etc/sing-box/conf/03_route.json
+    [[ -f /etc/sing-box/config.json.backup ]] && mv /etc/sing-box/config.json.backup /etc/sing-box/config.json
+    
+    systemctl restart sing-box
+    yellow "已恢复sing-box配置备份"
+}
+
+# 创建WireGuard服务作为备用方案
+create_wireguard_service() {
+    log_info "创建WireGuard服务作为备用方案"
+    
+    # 转换配置为WireGuard格式
+    convert_to_wireguard_config
+    
+    cat > /etc/systemd/system/warp-socks5.service <<EOF
+[Unit]
+Description=WARP WireGuard Interface
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/wg-quick up wg0
+ExecStop=/usr/bin/wg-quick down wg0
+ExecStartPre=/bin/sleep 3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable warp-socks5
+    green "WireGuard备用服务已创建"
+}
+
+# 转换为WireGuard配置
+convert_to_wireguard_config() {
+    if [[ -f $WARP_CONFIG ]]; then
+        # 提取必要信息并创建标准WireGuard配置
+        cp $WARP_CONFIG /etc/wireguard/wg0.conf
+        
+        # 移除Socks5配置段
+        sed -i '/\[Socks5\]/,$d' /etc/wireguard/wg0.conf
+        
+        green "已转换为WireGuard配置格式"
+    fi
+}systemctl daemon-reload
     systemctl enable warp-socks5
     green "WARP Socks5服务已创建"
 }
@@ -751,12 +1157,104 @@ apply_fscarmen_singbox_config() {
     restart_singbox_service
 }
 
-# 创建fscarmen路由配置
+# 创建fscarmen路由配置 - 修复sing-box 1.8+兼容性
 create_fscarmen_route_config() {
     local route_file="/etc/sing-box/conf/03_route.json"
     local warp_domains=$(cat $CONFIG_DIR/warp-domains.json)
     
-    cat > $route_file <<EOF
+    # 检测sing-box版本
+    local singbox_version=""
+    if command -v sing-box &> /dev/null; then
+        singbox_version=$(sing-box version 2>/dev/null | grep -oP 'sing-box version \K[0-9.]+' | head -1)
+    fi
+    
+    log_info "检测到sing-box版本: $singbox_version"
+    
+    # 根据版本生成不同的配置
+    if [[ -n "$singbox_version" ]] && version_compare "$singbox_version" "1.8.0"; then
+        # sing-box 1.8.0+ 使用新格式
+        create_modern_singbox_route_config "$route_file" "$warp_domains"
+    else
+        # 旧版本使用传统格式
+        create_legacy_singbox_route_config "$route_file" "$warp_domains"
+    fi
+}
+
+# 版本比较函数
+version_compare() {
+    local version1="$1"
+    local version2="$2"
+    
+    # 简单的版本比较 (适用于major.minor.patch格式)
+    local v1_major=$(echo "$version1" | cut -d. -f1)
+    local v1_minor=$(echo "$version1" | cut -d. -f2)
+    local v2_major=$(echo "$version2" | cut -d. -f1)
+    local v2_minor=$(echo "$version2" | cut -d. -f2)
+    
+    if [[ $v1_major -gt $v2_major ]] || 
+       [[ $v1_major -eq $v2_major && $v1_minor -ge $v2_minor ]]; then
+        return 0  # version1 >= version2
+    else
+        return 1  # version1 < version2
+    fi
+}
+
+# 现代sing-box路由配置 (1.8.0+)
+create_modern_singbox_route_config() {
+    local route_file="$1"
+    local warp_domains="$2"
+    
+    cat > "$route_file" <<EOF
+{
+    "route": {
+        "auto_detect_interface": true,
+        "final": "direct",
+        "rules": [
+            {
+                "protocol": "dns",
+                "outbound": "dns-out"
+            },
+            {
+                "port": 53,
+                "outbound": "dns-out"
+            },
+            {
+                "protocol": ["quic"],
+                "outbound": "block"
+            },
+            {
+                "domain_suffix": $warp_domains,
+                "outbound": "warp-socks5"
+            },
+            {
+                "domain_keyword": ["openai", "anthropic", "claude", "chatgpt", "bard", "perplexity"],
+                "outbound": "warp-socks5"
+            },
+            {
+                "domain_suffix": [".cn", ".中国", ".中國"],
+                "outbound": "direct"
+            },
+            {
+                "domain_keyword": ["baidu", "qq", "taobao", "tmall", "alipay", "wechat", "weixin"],
+                "outbound": "direct"
+            },
+            {
+                "ip_cidr": ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8"],
+                "outbound": "direct"
+            }
+        ]
+    }
+}
+EOF
+    green "已创建现代sing-box路由配置 (兼容1.8.0+)"
+}
+
+# 传统sing-box路由配置 (1.8.0以下)
+create_legacy_singbox_route_config() {
+    local route_file="$1"
+    local warp_domains="$2"
+    
+    cat > "$route_file" <<EOF
 {
     "route": {
         "auto_detect_interface": true,
@@ -794,10 +1292,10 @@ create_fscarmen_route_config() {
     }
 }
 EOF
-    green "已创建路由配置文件"
+    green "已创建传统sing-box路由配置"
 }
 
-# 应用标准sing-box配置
+# 应用标准sing-box配置 - 修复新版兼容性
 apply_standard_singbox_config() {
     log_info "应用标准sing-box配置"
     
@@ -814,6 +1312,12 @@ apply_standard_singbox_config() {
     local current_config=$(cat $config_file)
     local warp_domains=$(cat $CONFIG_DIR/warp-domains.json)
     
+    # 检测sing-box版本以确定规则格式
+    local singbox_version=""
+    if command -v sing-box &> /dev/null; then
+        singbox_version=$(sing-box version 2>/dev/null | grep -oP 'sing-box version \K[0-9.]+' | head -1)
+    fi
+    
     # 添加WARP Socks5出站
     local warp_outbound='{
         "type": "socks",
@@ -823,35 +1327,87 @@ apply_standard_singbox_config() {
         "version": "5"
     }'
     
-    # 创建新的路由规则
+    # 根据版本创建不同的路由规则
     local warp_domain_rule='{
         "domain_suffix": '"$warp_domains"',
         "outbound": "warp-socks5"
     }'
     
-    local warp_geosite_rule='{
-        "geosite": ["openai", "anthropic", "google", "github", "telegram", "discord"],
-        "outbound": "warp-socks5"
-    }'
-    
-    # 更新配置
-    local updated_config=$(echo "$current_config" | jq --argjson warpout "$warp_outbound" --argjson warpdomain "$warp_domain_rule" --argjson warpgeo "$warp_geosite_rule" '
-        # 添加出站
-        if .outbounds then
-            .outbounds = [.outbounds[] | select(.tag != "warp-socks5")] + [$warpout]
-        else
-            .outbounds = [$warpout]
-        end |
+    local updated_config
+    if [[ -n "$singbox_version" ]] && version_compare "$singbox_version" "1.8.0"; then
+        # sing-box 1.8.0+ 使用关键词匹配替代geosite
+        local warp_keyword_rule='{
+            "domain_keyword": ["openai", "anthropic", "claude", "chatgpt", "bard", "perplexity", "github", "telegram", "discord", "twitter", "facebook", "youtube"],
+            "outbound": "warp-socks5"
+        }'
         
-        # 添加路由规则
-        if .route and .route.rules then
-            .route.rules = [$warpdomain, $warpgeo] + (.route.rules | map(select(.outbound != "warp-socks5")))
-        elif .route then
-            .route.rules = [$warpdomain, $warpgeo]
-        else
-            .route = {"rules": [$warpdomain, $warpgeo], "final": "direct"}
-        end
-    ')
+        local direct_keyword_rule='{
+            "domain_keyword": ["baidu", "qq", "taobao", "tmall", "alipay", "wechat", "weixin"],
+            "outbound": "direct"
+        }'
+        
+        local direct_suffix_rule='{
+            "domain_suffix": [".cn", ".中国", ".中國"],
+            "outbound": "direct"
+        }'
+        
+        local direct_ip_rule='{
+            "ip_cidr": ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8"],
+            "outbound": "direct"
+        }'
+        
+        updated_config=$(echo "$current_config" | jq --argjson warpout "$warp_outbound" --argjson warpdomain "$warp_domain_rule" --argjson warpkeyword "$warp_keyword_rule" --argjson directkeyword "$direct_keyword_rule" --argjson directsuffix "$direct_suffix_rule" --argjson directip "$direct_ip_rule" '
+            # 添加出站
+            if .outbounds then
+                .outbounds = [.outbounds[] | select(.tag != "warp-socks5")] + [$warpout]
+            else
+                .outbounds = [$warpout]
+            end |
+            
+            # 添加路由规则
+            if .route and .route.rules then
+                .route.rules = [$warpdomain, $warpkeyword, $directkeyword, $directsuffix, $directip] + (.route.rules | map(select(.outbound != "warp-socks5")))
+            elif .route then
+                .route.rules = [$warpdomain, $warpkeyword, $directkeyword, $directsuffix, $directip]
+            else
+                .route = {"rules": [$warpdomain, $warpkeyword, $directkeyword, $directsuffix, $directip], "final": "direct"}
+            end
+        ')
+    else
+        # 旧版本使用geosite
+        local warp_geosite_rule='{
+            "geosite": ["openai", "anthropic", "google", "github", "telegram", "discord"],
+            "outbound": "warp-socks5"
+        }'
+        
+        local direct_geosite_rule='{
+            "geosite": ["cn", "apple-cn", "google-cn"],
+            "outbound": "direct"
+        }'
+        
+        local direct_geoip_rule='{
+            "geoip": ["cn", "private"],
+            "outbound": "direct"
+        }'
+        
+        updated_config=$(echo "$current_config" | jq --argjson warpout "$warp_outbound" --argjson warpdomain "$warp_domain_rule" --argjson warpgeo "$warp_geosite_rule" --argjson directgeo "$direct_geosite_rule" --argjson directip "$direct_geoip_rule" '
+            # 添加出站
+            if .outbounds then
+                .outbounds = [.outbounds[] | select(.tag != "warp-socks5")] + [$warpout]
+            else
+                .outbounds = [$warpout]
+            end |
+            
+            # 添加路由规则
+            if .route and .route.rules then
+                .route.rules = [$warpdomain, $warpgeo, $directgeo, $directip] + (.route.rules | map(select(.outbound != "warp-socks5")))
+            elif .route then
+                .route.rules = [$warpdomain, $warpgeo, $directgeo, $directip]
+            else
+                .route = {"rules": [$warpdomain, $warpgeo, $directgeo, $directip], "final": "direct"}
+            end
+        ')
+    fi
     
     echo "$updated_config" > $config_file
     
